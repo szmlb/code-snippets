@@ -1,0 +1,216 @@
+s = tf('s');
+
+%% Simulation parameters definition
+Jm = 0.5;
+Jl = 2.5;
+J = (Jm * Jl) / (Jm + Jl);
+Ks = 200.0;
+Ds = 0.0;
+taum = 0.0;
+taud = 0.0;
+taul = 0.0;
+sampling_time = 0.001;
+%state
+xvec = [0.0; 0.0; 0.0; 0.0];
+dxvec = [0.0; 0.0; 0.0; 0.0];
+% for controller
+control_sampling_time = sampling_time;
+Jn = J;
+Jmn = Jm; % / 50
+Jln = Jl / 2.0;  % Jlのロバスト安定性は高い. しかしロバスト性能は低い.
+Bmn = 0.0;
+Bln = 10.0;
+Dsn = Ds;
+Ksn = Ks / 1.0; % / 3.5 % Ksの変動に対するロバスト性能は高い. しかしロバスト安定性は低い.
+
+%% 3DoF controller design
+%Plant transfer functions
+%P1(s)
+num_P1n = Ksn * s;
+den_P1n = Jln * Jmn * s^3 + (Jmn * Bln + Jln * Bmn) * s^2 + (Ksn * Jmn + Ksn * Jln + Bmn * Bln) * s + (Bmn * Ksn + Bln * Ksn);
+sysP1n = num_P1n / den_P1n;
+%P2(s)
+num_P2n = 1.0;
+den_P2n = s^2;
+sysP2n = num_P2n / den_P2n;
+%Controller transfer functions
+% Gyr(s)
+tau = 0.01;%0.075
+tilde = 0.9;
+wcQ1 = 100.0;
+wcQ2 = 500.0;%800.0
+num_Gyr = tf(1.0);
+den_Gyr = (tau * s + 1.0)^4;
+sysGyr = num_Gyr / den_Gyr;
+
+%Q1(s)
+num_Q1 = wcQ1^4;
+den_Q1 = (s + wcQ1)^4;
+sysQ1 = num_Q1 / den_Q1;
+%Q2(s)
+num_Q2 = wcQ2^4;
+den_Q2 = (s + wcQ2)^4;
+sysQ2 = num_Q2 / den_Q2;
+
+%定常偏差を零とするような設計法
+wcS1 = 100.0;
+wcS2 = 200.0;
+%S1(s)
+num_S1 = s^2 * (s^3 + 3 * wcS1 * s^2 + 5 * wcS1^2 * s + 5 * wcS1^3);
+den_S1 = (s^2 + wcS1 * s + wcS1^2)^2 * (s + wcS1);
+sysS1 = num_S1 / den_S1;
+%S2(s)
+num_S2 = s^2 * (s^3 + 3 * wcS2 * s^2 + 5 * wcS2^2 * s + 5 * wcS2^3);
+den_S2 = (s^2 + wcS2 * s + wcS2^2)^2 * (s + wcS2);
+sysS2 = num_S2 / den_S2;
+sysQ1 = 1 - sysS1;
+sysQ2 = 1 - sysS2;
+
+%C1(s)
+sysC1 = sysGyr / (sysP1n * sysP2n * (1-sysQ1));
+[Ac1, Bc1, Cc1, Dc1] = ssdata(sysC1);
+%C2(s)
+sysC2 = (sysQ1 - sysQ2) / (sysP1n * (1-sysQ1));
+[Ac2, Bc2, Cc2, Dc2] = ssdata(sysC2);
+%C3(s)
+sysC3 = (sysQ2) / (sysP1n * sysP2n * (1-sysQ1));
+[Ac3, Bc3, Cc3, Dc3] = ssdata(sysC3);
+%discretization
+sysC1d = c2d(sysC1, control_sampling_time);
+[Ac1d, Bc1d, Cc1d, Dc1d] = ssdata(sysC1d);
+sysC2d = c2d(sysC2, control_sampling_time);
+[Ac2d, Bc2d, Cc2d, Dc2d] = ssdata(sysC2d);
+sysC3d = c2d(sysC3, control_sampling_time);
+[Ac3d, Bc3d, Cc3d, Dc3d] = ssdata(sysC3d);
+xvecC1 = zeros(size(Bc1), 1);
+xvecC2 = zeros(size(Bc2), 1);
+xvecC3 = zeros(size(Bc3), 1);
+
+%for compensate load side disturbance
+%C1(s)
+wlm = 1000.0;
+sysDlm = (Jmn * s^2 + Ksn) / Ksn * (wlm^2 / (s + wlm)^2);
+[Alm, Blm, Clm, Dlm] = ssdata(sysDlm);
+xvecDlm = zeros(size(Blm), 1);
+
+%% main loop 1[sec]
+time_sample = 10 * (1 / sampling_time);
+for i = 1:1:time_sample
+    time = (i - 1) * sampling_time;
+
+    control_delay = control_sampling_time / sampling_time; %[sample]
+    if mod(i, control_delay) == 0
+       %% Calculation for each control sampling
+       %% definition for control parameters
+        if i == 1
+            tmp4 = 0.0;
+            estimated_taul = 0.0;
+            estimated_taulm = 0.0;
+        end
+       %% feedforward and feedback controllers 
+        % 3DoF controller
+        if(time < 0.1)
+            ql_cmd = 0.0;
+        else
+            ql_cmd = 1.0;
+        end
+        ql_res = xvec(3);% + (rand - 0.5) / 1.0;
+        taus_res = Ksn * (xvec(1) - xvec(3));
+        
+        %continuous controller
+        %dx = Ax + Bu
+        %y = Cx + Du
+        % C1
+        dxvecC1 = Ac1 * xvecC1 + Bc1 * ql_cmd;
+        uC1 = Cc1 * xvecC1 + Dc1 * ql_cmd;    
+        xvecC1 = xvecC1 + dxvecC1 * control_sampling_time;
+        % C2
+        dxvecC2 = Ac2 * xvecC2 + Bc2 * dxvec(4); 
+        uC2 = Cc2 * xvecC2 + Dc2 * dxvec(4);     
+        xvecC2 = xvecC2 + dxvecC2 * control_sampling_time;
+        % C3
+        dxvecC3 = Ac3 * xvecC3 + Bc3 * ql_res; 
+        uC3 = Cc3 * xvecC3 + Dc3 * ql_res;     
+        xvecC3 = xvecC3 + dxvecC3 * control_sampling_time;
+        % control input
+        taum = uC1 - uC2 - uC3;% + estimated_taulm;
+        
+        %{
+        %discritized controller(うまくいってない)
+        %}
+
+        % torsion torque controled joint disturbance observer
+        wc_dob = 1000.0;
+        tmp3 = taus_res + Jln * wc_dob * xvec(4);
+        tmp4 = (tmp4 + control_sampling_time * wc_dob * tmp3) / (1 + control_sampling_time * wc_dob);
+        estimated_taul = tmp4 - Jln * wc_dob * xvec(4);
+        
+        % C3
+        dxvecDlm = Alm * xvecDlm + Blm * estimated_taul; 
+        estimated_taulm = Clm * xvecDlm + Dlm * estimated_taul;     
+        xvecDlm = xvecDlm + dxvecDlm * control_sampling_time;
+        
+       %% data update
+        time_data(i) = time;
+        xvec0_data(i) = xvec(1);
+        xvec1_data(i) = xvec(2);
+        xvec2_data(i) = xvec(3);
+        xvec3_data(i) = xvec(4);
+        cmd_data(i) = ql_cmd;
+        taum_data(i) = taum;
+        taul_data(i) = estimated_taul;
+        %""" controller end """
+    end
+        
+    %% Plant update
+    %reaction torque
+    if(time < 0.3)
+        taud = 0.0;
+        taul = 0.0;
+        %taul = 1.0 * sin(2.0 * pi * 10.0 * time);
+    elseif(time < 0.4)
+        taud = 0.0; %3.0
+        taul = 0.0; %0.0
+    else
+        taud = 0.0; %3.0
+        taul = 300.0;%50.0; %100.0
+    end
+    
+    % derivative calculation
+    dxvec = calc_deri(xvec, Jm, Jl, Ks, Ds, taum, taud, taul);
+    % euler-integration
+    xvec = update(xvec, dxvec, sampling_time);
+
+end
+
+%% data plot
+%figure(0)
+plot(time_data, cmd_data, time_data, xvec0_data, time_data, xvec2_data)
+legend('cmd', 'qm', 'ql')
+grid()
+xlabel('time [s]')
+ylabel('ql [rad]')
+
+figure();
+plot(time_data, taum_data)
+legend('cmd', 'res')
+grid()
+xlabel('time [s]')
+ylabel('torque [Nm]')
+
+figure();
+plot(time_data, taul_data)
+legend('cmd', 'res')
+grid()
+xlabel('time [s]')
+ylabel('torque [Nm]')
+
+%{
+figure();
+plot(time_data, cmd_data, time_data, xvec2_data, time_data, xvec2_data2)
+legend('cmd', 'res', 'res')
+grid()
+xlabel('time [s]')
+ylabel('angle [rad]')
+xlim([0, 1.0])
+%}
